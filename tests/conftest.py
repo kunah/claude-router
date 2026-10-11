@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import textwrap
 
 import pytest
@@ -9,31 +11,43 @@ STATE_WORK = {
     "oauthAccount": {"emailAddress": "work@example.com", "organizationName": "Work Inc", "displayName": "Worker"}
 }
 
-FAKE_CLAUDE = """\
-#!/bin/sh
-if [ "$1" = "--version" ]; then echo "9.9.9 (Claude Code)"; exit 0; fi
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-  printf '{"loggedIn": true, "email": "fake@example.com", "orgName": "Fake Org", "subscriptionType": "pro", "configDirectory": "%s"}\\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-  exit 0
-fi
-printf 'CLAUDE_CONFIG_DIR=%s\\n' "${CLAUDE_CONFIG_DIR-<unset>}"
-printf 'CLAUDE_ROUTER_ACCOUNT=%s\\n' "${CLAUDE_ROUTER_ACCOUNT-<unset>}"
-for a in "$@"; do printf 'ARG=%s\\n' "$a"; done
-exit 3
+# Stand-in for the claude binary: answers --version and `auth status`, otherwise prints what it
+# received and exits 3. It runs through a tiny sh launcher on POSIX and a claude.cmd on Windows.
+FAKE_CLAUDE_PY = """\
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("9.9.9 (Claude Code)")
+    sys.exit(0)
+if args[:2] == ["auth", "status"]:
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    print(json.dumps({"loggedIn": True, "email": "fake@example.com", "orgName": "Fake Org",
+                      "subscriptionType": "pro", "configDirectory": config_dir}))
+    sys.exit(0)
+for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_ROUTER_ACCOUNT", "CLAUDE_ROUTER_DEPTH"):
+    print(name + "=" + os.environ.get(name, "<unset>"))
+for arg in args:
+    print("ARG=" + arg)
+sys.exit(3)
 """
 
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """Isolated HOME with a stock ~/.claude that is 'logged in' as work@example.com."""
+    """Isolated home directory with a stock ~/.claude that is 'logged in' as work@example.com."""
     h = tmp_path / "home"
     h.mkdir()
     monkeypatch.setenv("HOME", str(h))
+    monkeypatch.setenv("USERPROFILE", str(h))  # what os.path.expanduser reads on Windows
     for var in (
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_ROUTER_ACCOUNT",
         "CLAUDE_ROUTER_DRY_RUN",
         "CLAUDE_ROUTER_QUIET",
+        "CLAUDE_ROUTER_DEPTH",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
@@ -48,13 +62,19 @@ def home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_claude(tmp_path):
-    """A shell script standing in for the claude binary (prints env + args, exits 3)."""
+    impl = tmp_path / "fake-impl" / "fake_claude.py"
+    impl.parent.mkdir(exist_ok=True)
+    impl.write_text(FAKE_CLAUDE_PY)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    script = bin_dir / "claude"
-    script.write_text(FAKE_CLAUDE)
-    script.chmod(0o755)
-    return script
+    if os.name == "nt":
+        launcher = bin_dir / "claude.cmd"
+        launcher.write_text(f'@"{sys.executable}" "{impl}" %*\r\n@exit /b %errorlevel%\r\n', newline="")
+    else:
+        launcher = bin_dir / "claude"
+        launcher.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{impl}' \"$@\"\n")
+        launcher.chmod(0o755)
+    return launcher
 
 
 @pytest.fixture

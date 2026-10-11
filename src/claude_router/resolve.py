@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import fnmatch
 import os
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .config import Account, Config, Route, expand_path, is_stock_dir
+from .config import IS_WINDOWS, Account, Config, Route, expand_path, is_absolute, is_stock_dir, match_form
 
 ACCOUNT_ENV = "CLAUDE_ROUTER_ACCOUNT"
 CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
@@ -34,6 +32,11 @@ class Decision:
     cwd: str = ""
 
 
+def env_key(name: str) -> str:
+    """Environment variable names are case-insensitive on Windows (Python keeps them upper-case)."""
+    return name.upper() if IS_WINDOWS else name
+
+
 def candidate_cwds(
     path: str | None = None,
     *,
@@ -42,29 +45,33 @@ def candidate_cwds(
 ) -> list[str]:
     """Directory strings to match against.
 
-    For an explicit ``path``: the expanded path plus its realpath. Otherwise the logical ``$PWD``
-    (when it names the same directory, so symlinked paths keep matching) followed by the physical cwd.
+    For an explicit ``path``: the expanded absolute path plus its realpath. Otherwise the logical
+    ``$PWD`` (when it names the same directory, so symlinked paths keep matching), the physical cwd,
+    and its realpath when that differs. A non-native ``$PWD`` (Git Bash's ``/c/...``) is ignored.
     """
     if path is not None:
-        expanded = os.path.normpath(os.path.abspath(expand_path(path)))
+        expanded = os.path.abspath(expand_path(path))
         real = os.path.realpath(expanded)
-        return [expanded] + ([real] if real != expanded else [])
+        return [expanded] + ([real] if os.path.normcase(real) != os.path.normcase(expanded) else [])
     environ = os.environ if environ is None else environ
     physical = cwd or os.getcwd()
     out: list[str] = []
     logical = environ.get("PWD")
-    if logical and os.path.isabs(logical) and logical != physical:
+    if logical and is_absolute(logical) and logical != physical:
         try:
             if os.path.samefile(logical, physical):
                 out.append(expand_path(logical))
         except OSError:
             pass
     out.append(physical)
+    real = os.path.realpath(physical)  # subst drives, junctions and short names on Windows
+    if os.path.normcase(real) != os.path.normcase(physical):
+        out.append(real)
     return out
 
 
 def ancestors(path: str) -> list[str]:
-    """``/a/b/c`` -> ``['/a/b/c', '/a/b', '/a', '/']``."""
+    """``/a/b/c`` -> ``['/a/b/c', '/a/b', '/a', '/']`` (``C:\\a`` -> ``['C:\\a', 'C:\\']`` on Windows)."""
     out = [path]
     while True:
         parent = os.path.dirname(path)
@@ -75,20 +82,27 @@ def ancestors(path: str) -> list[str]:
     return out
 
 
+def _is_within(child: str, parent: str) -> bool:
+    child, parent = os.path.normcase(child), os.path.normcase(parent)
+    if child == parent:
+        return True
+    if not parent.endswith(os.sep):
+        parent += os.sep
+    return child.startswith(parent)
+
+
 def route_matches(route: Route, cwd: str) -> str | None:
     """Return the directory (cwd or an ancestor) the route matched, or None."""
     if route.kind == "path":
         for prefix in (route.pattern, route.realpath):
-            if not prefix:
-                continue
-            if cwd == prefix or cwd.startswith(prefix.rstrip("/") + "/"):
+            if prefix and _is_within(cwd, prefix):
                 return prefix
         return None
+    matcher = route.matcher()
     for directory in ancestors(cwd):
-        if route.kind == "glob":
-            if fnmatch.fnmatchcase(directory, route.pattern):
-                return directory
-        elif re.search(route.pattern, directory):
+        form = match_form(directory)
+        found = matcher.match(form) if route.kind == "glob" else matcher.search(form)
+        if found:
             return directory
     return None
 
@@ -127,24 +141,26 @@ def resolve_account(cfg: Config, cwds: list[str], override: str | None = None) -
 
 def build_env(cfg: Config, account: Account | None, base: Mapping[str, str]) -> dict[str, str]:
     """Environment for the child process. ``CLAUDE_CONFIG_DIR`` is unset for the stock directory."""
-    env = dict(base)
+    env = {env_key(key): value for key, value in base.items()}
     if account is None:
         return env
     env.pop(CONFIG_DIR_ENV, None)
     if not is_stock_dir(account.config_dir):
         env[CONFIG_DIR_ENV] = account.config_dir
     for name in (*cfg.unset_env, *account.unset_env):
-        env.pop(name, None)
-    env.update(account.env)
+        env.pop(env_key(name), None)
+    for key, value in account.env.items():
+        env[env_key(key)] = value
     env[ACCOUNT_ENV] = account.name
     return env
 
 
 def env_changes(base: Mapping[str, str], env: Mapping[str, str]) -> dict[str, str | None]:
     """Variables that differ between ``base`` and ``env`` (None = removed)."""
+    before = {env_key(key): value for key, value in base.items()}
     out: dict[str, str | None] = {}
-    for key in set(base) | set(env):
-        if base.get(key) != env.get(key):
+    for key in set(before) | set(env):
+        if before.get(key) != env.get(key):
             out[key] = env.get(key)
     return dict(sorted(out.items()))
 

@@ -2,20 +2,30 @@
 
 Only the standard library and PyYAML are imported here: this module sits on the
 ``route-claude`` hot path.
+
+Paths work the same way on POSIX and Windows: they are compared case-insensitively on
+Windows, and globs/regexes are always matched against paths written with ``/``
+(``C:/Users/me/dev`` on Windows), so one config style works everywhere.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shlex
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+
+IS_WINDOWS = os.name == "nt"
+SEPARATORS = "/\\" if IS_WINDOWS else "/"
+MATCH_FLAGS = re.IGNORECASE if IS_WINDOWS else 0  # Windows paths are case-insensitive
 
 CONFIG_ENV = "CLAUDE_ROUTER_CONFIG"
 DEFAULT_CONFIG_NAME = ".claude-router.yaml"
@@ -26,6 +36,8 @@ GLOB_CHARS = "*?["
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 _REGEX_META = set(".^$*+?{}[]\\|()")
+_BARE_DRIVE = re.compile(r"^[A-Za-z]:$")
+_ROOTED_MATCH_FORM = re.compile(r"^(?:/|[A-Za-z]:/)")
 _KNOWN_KEYS = {"version", "claude_path", "default", "args", "unset_env", "announce", "accounts", "routes"}
 _HEADER = (
     "# claude-router configuration.\n"
@@ -42,7 +54,7 @@ class ConfigError(Exception):
 @dataclass
 class Account:
     name: str
-    config_dir: str  # canonical: absolute, ``~`` expanded, no trailing slash, *not* realpath'd
+    config_dir: str  # canonical: absolute, ``~`` expanded, normalised, *not* realpath'd
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     unset_env: list[str] = field(default_factory=list)
@@ -53,10 +65,23 @@ class Route:
     match: str  # as written in the file (for display and round-tripping)
     account: str
     kind: RouteKind
-    pattern: str  # expanded pattern used for matching
+    pattern: str  # path: native absolute path; glob/regex: pattern over "/"-separated paths
     specificity: int  # components in the literal directory prefix
     index: int  # position in the file (tie breaker)
     realpath: str | None = None  # path kind only: realpath when it differs from ``pattern``
+    compiled: re.Pattern[str] | None = field(default=None, repr=False, compare=False)
+
+    def matcher(self) -> re.Pattern[str]:
+        if self.compiled is None:
+            source = fnmatch.translate(self.pattern) if self.kind == "glob" else self.pattern
+            self.compiled = re.compile(source, MATCH_FLAGS)
+        return self.compiled
+
+    def key(self) -> tuple[str, str]:
+        """Identity used to spot duplicate routes."""
+        if self.kind == "path":
+            return (self.kind, os.path.normcase(self.pattern))
+        return (self.kind, self.pattern.lower() if IS_WINDOWS else self.pattern)
 
 
 @dataclass
@@ -98,37 +123,92 @@ def stock_config_dir() -> str:
     return os.path.join(home_dir(), ".claude")
 
 
-def is_stock_dir(path: str) -> bool:
-    return os.path.realpath(path) == os.path.realpath(stock_config_dir())
+def is_absolute(path: str) -> bool:
+    """Absolute on this platform. On Windows that needs a drive (or UNC share) and a root."""
+    if IS_WINDOWS:
+        drive, rest = os.path.splitdrive(path)
+        return bool(drive) and rest[:1] in ("\\", "/")
+    return os.path.isabs(path)
 
 
 def expand_path(raw: str) -> str:
-    """Expand ``~``, normalise to NFC and strip trailing slashes. Keeps symlinks and relative paths."""
+    """Expand ``~``, normalise to NFC and to the platform's separators; no trailing separator."""
     text = unicodedata.normalize("NFC", str(raw).strip())
-    text = os.path.expanduser(text)
-    if len(text) > 1:
-        text = text.rstrip("/") or "/"
-    return text
+    if not text:
+        return text
+    return os.path.normpath(os.path.expanduser(text))
 
 
 def canonical_dir(raw: str, *, what: str = "path") -> str:
     """The exact string exported as ``CLAUDE_CONFIG_DIR`` (Claude Code hashes it for the Keychain)."""
     text = expand_path(raw)
-    if not os.path.isabs(text):
+    if not text or not is_absolute(text):
         raise ConfigError(f"{what} must be an absolute path or start with '~' (got {raw!r})")
-    return os.path.normpath(text)
+    return text
+
+
+def same_path(first: str, second: str) -> bool:
+    """True when both name the same file or directory (case-insensitive where the OS is)."""
+    try:
+        return os.path.samefile(first, second)
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
+
+
+def is_stock_dir(path: str) -> bool:
+    return same_path(path, stock_config_dir())
+
+
+def match_form(path: str) -> str:
+    """The form globs and regexes are matched against: ``/`` as separator on every platform."""
+    return path.replace("\\", "/") if IS_WINDOWS else path
+
+
+def path_components(path: str) -> list[str]:
+    return [part for part in re.split(r"[\\/]+" if IS_WINDOWS else r"/+", path) if part]
 
 
 def display_path(path: str) -> str:
-    home = home_dir()
-    if path == home:
+    """``~/...`` for paths inside the home directory (always with ``/``), the path itself otherwise."""
+    if not path:
+        return path
+    home = os.path.normpath(home_dir())
+    norm = os.path.normpath(path)
+    if os.path.normcase(norm) == os.path.normcase(home):
         return "~"
-    if path.startswith(home + os.sep):
-        return "~" + path[len(home) :]
+    prefix = home.rstrip(SEPARATORS) + os.sep
+    if os.path.normcase(norm).startswith(os.path.normcase(prefix)):
+        return "~/" + match_form(norm[len(prefix) :])
     return path
 
 
+def portable_path(path: str) -> str:
+    """How paths are stored in the config file: ``~`` for home and ``/`` separators everywhere."""
+    return match_form(display_path(path))
+
+
+def split_command(text: str) -> list[str]:
+    """Split a command line roughly the way the platform's shell would."""
+    if not IS_WINDOWS:
+        return shlex.split(text)
+    tokens: list[str] = []
+    for token in shlex.split(text, posix=False):  # keeps backslashes in Windows paths
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            token = token[1:-1]
+        tokens.append(token)
+    return tokens
+
+
 # --------------------------------------------------------------------------- routes
+
+
+def _strip_trailing_separators(text: str) -> str:
+    stripped = text.rstrip(SEPARATORS)
+    if not stripped:
+        return text[:1]  # the root itself
+    if IS_WINDOWS and _BARE_DRIVE.match(stripped):
+        return stripped + "\\"  # "C:" alone means "C:\"
+    return stripped
 
 
 def normalise_match(raw: str) -> str:
@@ -136,17 +216,12 @@ def normalise_match(raw: str) -> str:
     text = raw.strip()
     if text.startswith(REGEX_PREFIX):
         return text
-    if len(text) > 1:
-        text = text.rstrip("/") or "/"
-    for suffix in ("/**", "/*"):
-        if text.endswith(suffix) and len(text) > len(suffix):
-            text = text[: -len(suffix)]
-            break
+    text = _strip_trailing_separators(text)
+    for sep in SEPARATORS:
+        for suffix in (sep + "**", sep + "*"):
+            if text.endswith(suffix) and len(text) > len(suffix):
+                return _strip_trailing_separators(text[: -len(suffix)])
     return text or raw.strip()
-
-
-def _components(path: str) -> list[str]:
-    return [part for part in path.split("/") if part]
 
 
 def _regex_literal_prefix(body: str) -> str:
@@ -185,34 +260,37 @@ def parse_route(raw: Any, index: int) -> Route:
         body = match[len(REGEX_PREFIX) :]
         if not body:
             raise ConfigError(f"routes[{index}]: empty regex")
+        home = re.escape(match_form(home_dir()))
         for lead in ("^~/", "~/"):  # a leading ~ means the home directory
             if body.startswith(lead):
-                body = lead[:-2] + re.escape(home_dir()) + "/" + body[len(lead) :]
+                body = lead[:-2] + home + "/" + body[len(lead) :]
                 break
         try:
-            re.compile(body)
+            compiled = re.compile(body, MATCH_FLAGS)
         except re.error as exc:
             raise ConfigError(f"routes[{index}]: invalid regex {match!r}: {exc}") from exc
         prefix = _regex_literal_prefix(body)
-        specificity = len(_components(prefix)) if prefix.startswith("/") else 0
-        return Route(match, account, "regex", body, specificity, index)
+        specificity = len(path_components(prefix)) if _ROOTED_MATCH_FORM.match(prefix) else 0
+        return Route(match, account, "regex", body, specificity, index, compiled=compiled)
 
     text = expand_path(normalise_match(match))
-    if not os.path.isabs(text):
+    if not is_absolute(text):
         raise ConfigError(
             f"routes[{index}]: {match!r} must be an absolute path, start with '~', or use the 're:' prefix"
         )
     if any(char in text for char in GLOB_CHARS):
+        pattern = match_form(text)
         specificity = 0
-        for part in _components(text):
+        for part in path_components(pattern):
             if any(char in part for char in GLOB_CHARS):
                 break
             specificity += 1
-        return Route(match, account, "glob", text, specificity, index)
+        compiled = re.compile(fnmatch.translate(pattern), MATCH_FLAGS)
+        return Route(match, account, "glob", pattern, specificity, index, compiled=compiled)
 
-    text = os.path.normpath(text)
     real = os.path.realpath(text)
-    return Route(match, account, "path", text, len(_components(text)), index, real if real != text else None)
+    alternative = real if os.path.normcase(real) != os.path.normcase(text) else None
+    return Route(match, account, "path", text, len(path_components(text)), index, alternative)
 
 
 # --------------------------------------------------------------------------- (de)serialisation
@@ -222,7 +300,7 @@ def _str_list(value: Any, what: str) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return shlex.split(value)
+        return split_command(value)
     if isinstance(value, list) and all(isinstance(item, (str, int, float)) for item in value):
         return [str(item) for item in value]
     raise ConfigError(f"{what} must be a list of strings")
@@ -300,7 +378,7 @@ def from_dict(data: Any, path: Path, *, exists: bool) -> Config:
 
 
 def _account_dict(account: Account) -> dict[str, Any]:
-    out: dict[str, Any] = {"config_dir": display_path(account.config_dir)}
+    out: dict[str, Any] = {"config_dir": portable_path(account.config_dir)}
     if account.args:
         out["args"] = list(account.args)
     if account.env:
@@ -352,16 +430,29 @@ def load_config(path: Path | None = None, *, strict: bool = False) -> Config:
     return cfg
 
 
+def _replace(source: str, target: str) -> None:
+    """``os.replace``, retried briefly on Windows where a concurrent reader can hold the target open."""
+    attempts = 20 if IS_WINDOWS else 1
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05)
+
+
 def save_config(cfg: Config) -> None:
-    """Write atomically (temp file + rename) with mode 0600."""
+    """Write atomically (temp file + rename) with mode 0600 and LF line endings."""
     cfg.path.parent.mkdir(parents=True, exist_ok=True)
     text = _HEADER + yaml.safe_dump(to_dict(cfg), sort_keys=False, allow_unicode=True)
     handle, tmp = tempfile.mkstemp(prefix=".claude-router.", suffix=".tmp", dir=str(cfg.path.parent))
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
         os.chmod(tmp, 0o600)
-        os.replace(tmp, cfg.path)
+        _replace(tmp, str(cfg.path))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -383,16 +474,15 @@ def validate(cfg: Config) -> list[Problem]:
     if cfg.default and cfg.default not in cfg.accounts:
         error(f"default account {cfg.default!r} is not defined")
 
-    by_realpath: dict[str, str] = {}
-    for account in cfg.accounts.values():
-        real = os.path.realpath(account.config_dir)
-        if real in by_realpath:
-            error(
-                f"accounts {by_realpath[real]!r} and {account.name!r} use the same directory "
-                f"{display_path(account.config_dir)}"
-            )
-        else:
-            by_realpath[real] = account.name
+    accounts = list(cfg.accounts.values())
+    for position, account in enumerate(accounts):
+        for other in accounts[:position]:
+            if same_path(account.config_dir, other.config_dir):
+                error(
+                    f"accounts {other.name!r} and {account.name!r} use the same directory "
+                    f"{display_path(account.config_dir)}"
+                )
+                break
         if not os.path.isdir(account.config_dir):
             warning(
                 f"account {account.name!r}: directory {display_path(account.config_dir)} does not exist "
@@ -403,7 +493,7 @@ def validate(cfg: Config) -> list[Problem]:
     for route in cfg.routes:
         if route.account not in cfg.accounts:
             error(f"route {route.match!r} points to unknown account {route.account!r}")
-        key = (route.kind, route.pattern)
+        key = route.key()
         if key in seen:
             warning(f"route #{route.index + 1} {route.match!r} duplicates route #{seen[key] + 1} and will never win")
         else:

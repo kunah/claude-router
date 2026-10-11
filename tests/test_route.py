@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import signal
 import subprocess
 import sys
+import sysconfig
+
+import pytest
 
 from claude_router import route
 from claude_router.config import load_config
 from claude_router.resolve import Decision, candidate_cwds, resolve_account
+from helpers import same
 
 CONFIG = """
-claude_path: {claude}
+claude_path: '{claude}'
 default: work
 args: ["--effort", "max"]
 accounts:
@@ -18,6 +25,8 @@ accounts:
 routes:
   - {{match: ~/dev/oss, account: personal}}
 """
+
+EXPECTED_ARGS = "ARG=--effort\nARG=max\nARG=--model\nARG=opus\nARG=--help\nARG=two words\n"
 
 
 def setup(home, fake_claude, write_config, monkeypatch):
@@ -77,7 +86,8 @@ def test_missing_config_passes_through(home, fake_claude, monkeypatch, capsys):
     chdir(monkeypatch, home)
     assert route.main(["--version"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert data["account"] is None and data["argv"] == [str(fake_claude), "--version"] and data["env_changes"] == {}
+    assert data["account"] is None and data["env_changes"] == {}
+    assert same(data["argv"][0], fake_claude) and data["argv"][1:] == ["--version"]
 
 
 def test_broken_config_does_not_launch(home, fake_claude, write_config, monkeypatch, capsys):
@@ -104,6 +114,12 @@ def test_no_binary(home, write_config, monkeypatch, capsys, tmp_path):
     assert "could not find" in capsys.readouterr().err
 
 
+def test_loop_guard(home, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_ROUTER_DEPTH", str(route.MAX_DEPTH))
+    assert route.main([]) == 2
+    assert "points back at route-claude" in capsys.readouterr().err
+
+
 def test_announce(home, fake_claude, write_config, monkeypatch, capsys):
     setup(home, fake_claude, write_config, monkeypatch)
     cfg = load_config()
@@ -121,27 +137,53 @@ def test_announce(home, fake_claude, write_config, monkeypatch, capsys):
     assert "no route matched" in capsys.readouterr().err
 
 
-def test_exec_forwards_args_and_exit_code(home, fake_claude, write_config):
+def test_exit_status():
+    assert route.exit_status(3) == 3
+    assert route.exit_status(0xC000013A) == 0xC000013A - (1 << 32)  # STATUS_CONTROL_C_EXIT
+
+
+def test_spawn_and_wait(home, fake_claude, capfd):
+    """The Windows launch path, exercised on every platform."""
+    before = signal.getsignal(signal.SIGINT)
+    assert route.spawn_and_wait([str(fake_claude), "x y"], dict(os.environ)) == 3
+    assert "ARG=x y" in capfd.readouterr().out
+    assert signal.getsignal(signal.SIGINT) is before  # handlers restored
+    assert route.spawn_and_wait([os.path.join(str(home), "missing-claude")], dict(os.environ)) == 127
+
+
+def _run_router(command, home, cwd):
+    env = dict(os.environ)
+    env["PWD"] = str(cwd)
+    return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
+
+
+def _prepare_exec(home, fake_claude, write_config):
     personal = home / ".claude-personal"
     personal.mkdir()
     proj = home / "dev" / "oss" / "p"
     proj.mkdir(parents=True)
     write_config(CONFIG.format(claude=fake_claude))
-    env = {
-        "HOME": str(home),
-        "CLAUDE_ROUTER_CONFIG": str(home / ".claude-router.yaml"),
-        "PATH": "/usr/bin:/bin",
-        "PWD": str(proj),
-    }
-    result = subprocess.run(
-        [sys.executable, "-m", "claude_router.route", "--help", "two words"],
-        cwd=proj,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    return personal, proj
+
+
+def test_exec_forwards_args_and_exit_code(home, fake_claude, write_config):
+    personal, proj = _prepare_exec(home, fake_claude, write_config)
+    result = _run_router([sys.executable, "-m", "claude_router.route", "--help", "two words"], home, proj)
     assert result.returncode == 3, result.stderr
-    assert "ARG=--effort\nARG=max\nARG=--model\nARG=opus\nARG=--help\nARG=two words\n" in result.stdout
+    assert EXPECTED_ARGS in result.stdout
     assert f"CLAUDE_CONFIG_DIR={personal}\n" in result.stdout
     assert "CLAUDE_ROUTER_ACCOUNT=personal\n" in result.stdout
+    assert "CLAUDE_ROUTER_DEPTH=1\n" in result.stdout
     assert result.stderr == ""  # announce is auto and stdout is a pipe
+
+
+def test_console_script_end_to_end(home, fake_claude, write_config):
+    """The installed `route-claude` launcher (route-claude.exe on Windows) behaves the same."""
+    script = shutil.which("route-claude", path=sysconfig.get_path("scripts"))
+    if script is None:
+        pytest.skip("route-claude is not installed in this environment")
+    personal, proj = _prepare_exec(home, fake_claude, write_config)
+    result = _run_router([script, "--help", "two words"], home, proj)
+    assert result.returncode == 3, result.stderr
+    assert EXPECTED_ARGS in result.stdout
+    assert f"CLAUDE_CONFIG_DIR={personal}\n" in result.stdout

@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
+import subprocess
+import sys
 
 import pytest
 from typer.testing import CliRunner
 
 from claude_router.cli import app
-from claude_router.config import load_config, save_config
+from claude_router.config import load_config
+from helpers import IS_WINDOWS, posix_only, same, windows_only
 
 runner = CliRunner()
 
@@ -41,9 +45,11 @@ def test_init_registers_existing_dirs(home, on_path):
     cfg = load_config()
     assert set(cfg.accounts) == {"work", "personal"}
     assert cfg.default == "work"
-    assert cfg.claude_path == str(on_path)
+    assert same(cfg.claude_path, on_path)
     assert "logged in as me@gmail.com" in result.output
     assert "alias claude='route-claude'" in result.output
+    if IS_WINDOWS:
+        assert "Set-Alias -Name claude -Value route-claude" in result.output
     assert "~/.zshrc:1" in result.output
     # idempotent
     result = invoke("init", "--yes")
@@ -64,7 +70,7 @@ def test_add_creates_dir_and_defaults(home):
     result = invoke("add", "work2")
     assert result.exit_code == 0, result.output
     directory = home / ".claude-work2"
-    assert directory.is_dir() and stat.S_IMODE(os.stat(directory).st_mode) == 0o700
+    assert directory.is_dir()
     cfg = load_config()
     assert cfg.default == "work2" and cfg.accounts["work2"].config_dir == str(directory)
     assert "configure-route login work2" in result.output
@@ -79,6 +85,12 @@ def test_add_creates_dir_and_defaults(home):
     assert other.args == ["--model", "opus"] and other.env == {"FOO": "bar=baz"}
     assert load_config().default == "work2"
     assert invoke("add", "bad", "--env", "NOEQUALS").exit_code == 1
+
+
+@posix_only
+def test_add_dir_mode(home):
+    invoke("add", "work2")
+    assert stat.S_IMODE(os.stat(home / ".claude-work2").st_mode) == 0o700
 
 
 def test_add_existing_and_seed(home):
@@ -174,10 +186,23 @@ def test_routes(home, monkeypatch):
     assert invoke("route", "remove", "../other").exit_code == 0
     assert invoke("route", "remove", "~/abs").exit_code == 0
     assert [r.match for r in load_config().routes] == ["~/dev/work", "~/missing"]
+
     assert invoke("route", "remove", "2").exit_code == 0
     assert invoke("route", "remove", "~/dev/work/*").exit_code == 0
     assert load_config().routes == []
     assert invoke("route", "remove", "~/nothing").exit_code == 1
+
+
+@windows_only
+def test_routes_with_windows_paths(home, monkeypatch):
+    invoke("add", "work", "--config-dir", "~/.claude")
+    (home / "dev" / "work").mkdir(parents=True)
+    monkeypatch.chdir(home / "dev" / "work")
+    assert invoke("route", "add", "..\\other\\*", "work").exit_code == 0
+    assert invoke("route", "add", str(home / "Abs") + "\\", "work").exit_code == 0
+    assert [r.match for r in load_config().routes] == ["~/dev/other", "~/Abs"]
+    result = invoke("route", "add", str(home / "ABS"), "work")
+    assert "already exists" in result.output
 
 
 def test_which(home, on_path):
@@ -189,7 +214,7 @@ def test_which(home, on_path):
     result = invoke("which", str(home / "dev" / "x"))
     assert result.exit_code == 0, result.output
     assert "personal (~/.claude-personal)  [route ~/dev]" in result.output
-    assert f"CLAUDE_CONFIG_DIR={home}/.claude-personal" in result.output
+    assert f"CLAUDE_CONFIG_DIR={home / '.claude-personal'}" in result.output
     assert "--effort max" in result.output
 
     result = invoke("which", str(home / "elsewhere"), "--json")
@@ -221,6 +246,7 @@ def test_list(home, on_path):
     result = invoke("list", "--fast")
     assert result.exit_code == 0, result.output
     assert "work *" in result.output and "work@example.com" in result.output and "not logged in" in result.output
+    assert "CREDENTIALS" in result.output
     result = invoke("list")
     assert "fake@example.com (Fake Org, pro)" in result.output
 
@@ -234,15 +260,14 @@ def test_run_and_login_dry_run(home, on_path, monkeypatch):
     result = invoke("run", "personal", "-p", "hi")
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
-    assert data["argv"] == [str(on_path), "--effort", "max", "-p", "hi"]
+    assert same(data["argv"][0], on_path) and data["argv"][1:] == ["--effort", "max", "-p", "hi"]
     assert data["env_changes"]["CLAUDE_CONFIG_DIR"] == str(home / ".claude-personal")
 
     result = invoke("login", "personal", "--email", "x@y.z", "--sso")
-    data = json.loads(result.output)
-    assert data["argv"] == [str(on_path), "auth", "login", "--email", "x@y.z", "--sso"]
+    assert json.loads(result.output)["argv"][1:] == ["auth", "login", "--email", "x@y.z", "--sso"]
 
     result = invoke("logout", "work")
-    assert json.loads(result.output)["argv"] == [str(on_path), "auth", "logout"]
+    assert json.loads(result.output)["argv"][1:] == ["auth", "logout"]
     assert invoke("run", "ghost").exit_code == 1
 
 
@@ -258,7 +283,7 @@ def test_doctor(home, on_path, write_config):
     result = invoke("doctor")
     assert result.exit_code == 1, result.output
     assert "ghost" in result.output and "1 error(s)" in result.output
-    assert load_config().claude_path == str(on_path)
+    assert same(load_config().claude_path, on_path)
     assert "9.9.9 (Claude Code)" in result.output
 
     write_config(
@@ -283,6 +308,17 @@ def test_doctor_warns_about_env(home, on_path, write_config, monkeypatch):
     assert "ANTHROPIC_API_KEY exported" in result.output
 
 
+def test_doctor_reads_shell_profiles(home, on_path, write_config):
+    write_config("default: work\naccounts:\n  work: {config_dir: ~/.claude}\n")
+    profile = home / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
+    profile.parent.mkdir(parents=True)
+    profile.write_bytes("# profile\r\nSet-Alias -Name claude -Value route-claude\r\n".encode("utf-16"))
+    (home / ".bashrc").write_text("claude() { command claude --effort max \"$@\"; }\n")
+    result = invoke("doctor")
+    assert "~/Documents/PowerShell/Microsoft.PowerShell_profile.ps1:2 sends claude through route-claude" in result.output
+    assert "~/.bashrc:1 has `claude() {" in result.output
+
+
 def test_doctor_without_config(home, on_path):
     result = invoke("doctor")
     assert result.exit_code == 0, result.output
@@ -292,6 +328,9 @@ def test_doctor_without_config(home, on_path):
 
 def test_edit_validates(home, monkeypatch):
     invoke("add", "work", "--config-dir", "~/.claude")
-    monkeypatch.setenv("EDITOR", "true")
+    noop = [sys.executable, "-c", "pass"]
+    monkeypatch.setenv("EDITOR", subprocess.list2cmdline(noop) if IS_WINDOWS else shlex.join(noop))
+    monkeypatch.delenv("VISUAL", raising=False)
     result = invoke("edit")
-    assert result.exit_code == 0 and "is valid" in result.output
+    assert result.exit_code == 0, result.output
+    assert "is valid" in result.output

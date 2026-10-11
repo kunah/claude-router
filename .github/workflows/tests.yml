@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.14"]
+        exclude:
+          - os: macos-latest  # macOS minutes are expensive; one version is enough there
+            python: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # setup-uv publishes exact tags only
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: uv sync --locked
+      - name: Test
+        run: uv run pytest -v -rs
+      - name: Console scripts start
+        run: uv run configure-route --version

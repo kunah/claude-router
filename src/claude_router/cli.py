@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NoReturn, Optional
@@ -16,22 +17,28 @@ import typer
 
 from . import __version__, accounts, detect, resolve
 from .config import (
+    IS_WINDOWS,
     NAME_RE,
+    REGEX_PREFIX,
     Account,
     Config,
     ConfigError,
     canonical_dir,
     display_path,
     home_dir,
+    is_absolute,
     is_stock_dir,
     load_config,
     normalise_match,
     parse_route,
+    portable_path,
+    same_path,
     save_config,
+    split_command,
     stock_config_dir,
     validate,
 )
-from .route import DRY_RUN_ENV, PROG, dry_run_payload
+from .route import DRY_RUN_ENV, PROG, dry_run_payload, launch
 
 app = typer.Typer(
     help="Configure how `route-claude` picks a Claude Code account for each directory.",
@@ -43,8 +50,28 @@ route_app = typer.Typer(help="Manage directory -> account routes.", no_args_is_h
 app.add_typer(route_app, name="route")
 
 RED, GREEN, YELLOW = typer.colors.RED, typer.colors.GREEN, typer.colors.YELLOW
-SHELL_RC_FILES = (".zshrc", ".bashrc", ".bash_profile", ".profile")
 ALIAS_LINE = "alias claude='route-claude'"
+POWERSHELL_ALIAS_LINE = "Set-Alias -Name claude -Value route-claude"
+CMD_ALIAS_LINE = "doskey claude=route-claude $*"
+# Shell start-up files scanned (read-only, best effort) for an existing `claude` alias or function.
+SHELL_RC_FILES = (
+    ".zshrc",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".config/powershell/Microsoft.PowerShell_profile.ps1",
+    ".config/powershell/profile.ps1",
+    "Documents/PowerShell/Microsoft.PowerShell_profile.ps1",
+    "Documents/PowerShell/profile.ps1",
+    "Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1",
+    "Documents/WindowsPowerShell/profile.ps1",
+    "OneDrive/Documents/PowerShell/Microsoft.PowerShell_profile.ps1",
+    "OneDrive/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1",
+)
+_ALIAS_RE = re.compile(
+    r"^\s*(?:alias\s+claude\s*=|claude\s*\(\s*\)|function\s+claude\b|(?:set|new)-alias\s+(?:-name\s+)?claude\b)",
+    re.IGNORECASE,
+)
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -57,6 +84,11 @@ def _fail(message: str, code: int = 1) -> NoReturn:
 
 def _warn(message: str) -> None:
     typer.secho(f"warning: {message}", fg=YELLOW, err=True)
+
+
+def format_command(argv: list[str]) -> str:
+    """Render a command line the way the platform's shell reads it."""
+    return subprocess.list2cmdline(argv) if IS_WINDOWS else shlex.join(argv)
 
 
 def _load() -> Config:
@@ -82,9 +114,8 @@ def _require_account(cfg: Config, name: str) -> Account:
 
 
 def _account_for_dir(cfg: Config, path: str) -> Account | None:
-    real = os.path.realpath(path)
     for account in cfg.accounts.values():
-        if os.path.realpath(account.config_dir) == real:
+        if same_path(account.config_dir, path):
             return account
     return None
 
@@ -117,23 +148,28 @@ def _parse_env(items: Optional[list[str]]) -> dict[str, str]:
     return out
 
 
+def _shell_cwd() -> str:
+    """The shell's logical cwd (``$PWD``) when it names the real cwd, so symlinked paths stay as typed."""
+    cwd = os.getcwd()
+    logical = os.environ.get("PWD")
+    if logical and is_absolute(logical) and logical != cwd:
+        try:
+            if os.path.samefile(logical, cwd):
+                return logical
+        except OSError:
+            pass
+    return cwd
+
+
 def _absolute_match(match: str) -> str:
-    """Resolve a route match for storage: regexes untouched, relative paths against the shell cwd, home as ~."""
+    """Resolve a route match for storage: regexes untouched, relative paths against the cwd, home as ~."""
     text = normalise_match(match)
-    if text.startswith("re:"):
+    if text.startswith(REGEX_PREFIX):
         return text
     expanded = os.path.expanduser(text)
-    if not os.path.isabs(expanded):
-        cwd = os.getcwd()
-        logical = os.environ.get("PWD")
-        if logical and os.path.isabs(logical):
-            try:
-                if os.path.samefile(logical, cwd):
-                    cwd = logical
-            except OSError:
-                pass
-        expanded = os.path.normpath(os.path.join(cwd, expanded))
-    return display_path(normalise_match(expanded))
+    if not is_absolute(expanded):
+        expanded = os.path.join(_shell_cwd(), expanded)
+    return portable_path(os.path.normpath(expanded))
 
 
 def _who(config_dir: str) -> str:
@@ -169,25 +205,44 @@ def _routes_table(cfg: Config) -> str:
     return _table(["#", "MATCH", "KIND", "SPECIFICITY", "ACCOUNT"], rows)
 
 
+def _read_lines(path: Path) -> list[str] | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    encoding = "utf-16" if data[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"  # PowerShell profiles vary
+    return data.decode(encoding, errors="replace").splitlines()
+
+
 def shell_alias_lines() -> list[tuple[str, int, str]]:
-    """Best-effort scan of shell rc files for an existing ``alias claude=...`` line."""
+    """Best-effort, read-only scan of shell start-up files for an existing ``claude`` alias or function."""
     out: list[tuple[str, int, str]] = []
-    for rc_name in SHELL_RC_FILES:
-        rc_path = Path(home_dir()) / rc_name
-        try:
-            lines = rc_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+    seen: set[str] = set()
+    for relative in SHELL_RC_FILES:
+        rc_path = Path(home_dir()) / relative
+        key = os.path.normcase(str(rc_path))
+        if key in seen:
+            continue
+        seen.add(key)
+        lines = _read_lines(rc_path)
+        if lines is None:
             continue
         for number, line in enumerate(lines, 1):
-            if re.match(r"^\s*alias\s+claude\s*=", line):
+            if _ALIAS_RE.match(line):
                 out.append((str(rc_path), number, line.strip()))
     return out
 
 
 def _print_shell_hint() -> None:
     typer.echo()
-    typer.echo("To send plain `claude` through the router, add this line to your shell rc file (e.g. ~/.zshrc):")
-    typer.echo(f"    {ALIAS_LINE}")
+    if IS_WINDOWS:
+        typer.echo("To send plain `claude` through the router, add the line for your shell:")
+        typer.echo(f"    PowerShell (in $PROFILE):  {POWERSHELL_ALIAS_LINE}")
+        typer.echo(f"    cmd.exe (doskey macro):    {CMD_ALIAS_LINE}")
+        typer.echo(f"    Git Bash (~/.bashrc):      {ALIAS_LINE}")
+    else:
+        typer.echo("To send plain `claude` through the router, add this line to your shell rc file (e.g. ~/.zshrc):")
+        typer.echo(f"    {ALIAS_LINE}")
     for path, number, line in shell_alias_lines():
         if "route-claude" in line:
             continue
@@ -195,7 +250,7 @@ def _print_shell_hint() -> None:
         typer.echo("      Extra flags belong in the router config, e.g. `configure-route args -- --effort max`.")
 
 
-def _exec_account(cfg: Config, account: Account, user_args: list[str], *, include_defaults: bool = True) -> None:
+def _exec_account(cfg: Config, account: Account, user_args: list[str], *, include_defaults: bool = True) -> NoReturn:
     claude = detect.find_claude(cfg.claude_path)
     if claude is None:
         _fail("could not find the `claude` binary; run `configure-route doctor`", 127)
@@ -204,11 +259,9 @@ def _exec_account(cfg: Config, account: Account, user_args: list[str], *, includ
     if os.environ.get(DRY_RUN_ENV):
         decision = resolve.Decision(account=account, reason="override", cwd=os.getcwd())
         typer.echo(json.dumps(dry_run_payload(decision, claude, argv, env), indent=2))
-        return
+        raise typer.Exit(0)
     typer.secho(f"{PROG}: {account.name} ({display_path(account.config_dir)}) via configure-route", err=True, dim=True)
-    if os.name == "nt":
-        raise typer.Exit(subprocess.run(argv, env=env).returncode)
-    os.execve(argv[0], argv, env)
+    raise typer.Exit(launch(argv, env))
 
 
 # ----------------------------------------------------------------------------- commands
@@ -371,7 +424,10 @@ def remove(
     _save(cfg)
     typer.echo(f"Removed account '{name}'" + (f" and {len(routes_using)} route(s)" if routes_using else ""))
     if delete_dir:
-        shutil.rmtree(account.config_dir)
+        try:
+            accounts.delete_config_dir(account.config_dir)
+        except OSError as exc:
+            _fail(f"could not delete {display_path(account.config_dir)}: {exc}")
         typer.echo(f"Deleted {display_path(account.config_dir)}")
     if delete_keychain:
         if accounts.keychain_delete(service):
@@ -406,14 +462,14 @@ def list_(
         if status is None:
             identity = accounts.login_identity(account.config_dir)
             status = f"{identity.email} ({identity.organization})" if identity and identity.email else "not logged in"
-        present = accounts.keychain_item_exists(accounts.keychain_service(account.config_dir))
-        keychain = "-" if present is None else ("yes" if present else "no")
-        return [name, directory, status, keychain]
+        present, _where = accounts.credentials_status(account.config_dir)
+        stored = "-" if present is None else ("yes" if present else "no")
+        return [name, directory, status, stored]
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         rows = list(pool.map(describe, cfg.accounts.values()))
     if rows:
-        typer.echo(_table(["ACCOUNT", "CONFIG DIR", "LOGIN", "KEYCHAIN"], rows))
+        typer.echo(_table(["ACCOUNT", "CONFIG DIR", "LOGIN", "CREDENTIALS"], rows))
         typer.echo("(* = default account)")
     else:
         typer.echo("No accounts. Run `configure-route init` or `configure-route add NAME`.")
@@ -421,7 +477,7 @@ def list_(
     typer.echo(_routes_table(cfg))
     if cfg.args:
         typer.echo()
-        typer.echo(f"Default claude args: {shlex.join(cfg.args)}")
+        typer.echo(f"Default claude args: {format_command(cfg.args)}")
 
 
 @app.command("set-default")
@@ -450,13 +506,13 @@ def args_(
         typer.echo(f"Cleared {label} args")
         return
     if not values:
-        typer.echo(f"global: {shlex.join(cfg.args) or '(none)'}")
+        typer.echo(f"global: {format_command(cfg.args) or '(none)'}")
         for acct in cfg.accounts.values():
-            typer.echo(f"{acct.name}: {shlex.join(acct.args) or '(none)'}")
+            typer.echo(f"{acct.name}: {format_command(acct.args) or '(none)'}")
         return
     target.args = list(values)
     _save(cfg)
-    typer.echo(f"Set {label} args: {shlex.join(values)}")
+    typer.echo(f"Set {label} args: {format_command(values)}")
 
 
 @route_app.command("add")
@@ -473,7 +529,7 @@ def route_add(
     except ConfigError as exc:
         _fail(str(exc))
     for existing in cfg.routes:
-        if existing.match == stored or (existing.kind, existing.pattern) == (route.kind, route.pattern):
+        if existing.match == stored or existing.key() == route.key():
             if existing.account == account:
                 typer.echo(f"Route {existing.match} -> {account} already exists")
                 return
@@ -575,7 +631,7 @@ def which(
     changes = resolve.env_changes(os.environ, env)
     rendered = ", ".join(f"{key}={value}" if value is not None else f"{key} (unset)" for key, value in changes.items())
     typer.echo(f"Environment: {rendered or 'unchanged'}")
-    typer.echo(f"Command:     {shlex.join(argv)}")
+    typer.echo(f"Command:     {format_command(argv)}")
 
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -655,7 +711,7 @@ def _run_doctor(cfg: Config, *, auth: bool) -> int:
         label += f"  ({detect.install_method(candidate)})"
         if candidate.target:
             label += f" -> {candidate.target}"
-        if candidate.path == selected:
+        if selected and os.path.normcase(candidate.path) == os.path.normcase(selected):
             report("ok", label + "  <- selected")
         elif candidate.broken:
             report("warning", label + "  broken symlink")
@@ -669,13 +725,20 @@ def _run_doctor(cfg: Config, *, auth: bool) -> int:
         report("info", "no claude binary found in the usual locations")
     if selected is None:
         report("error", "no usable `claude` binary; install Claude Code (https://code.claude.com/docs/en/setup)")
-    elif cfg.claude_path != selected:
-        cfg.claude_path = selected
-        if cfg.exists:
-            _save(cfg)
-            report("ok", f"recorded claude_path = {selected}")
-    if cfg.claude_path and selected and cfg.claude_path != selected:
-        report("warning", f"configured claude_path {cfg.claude_path} is not usable; using {selected}")
+    else:
+        if cfg.claude_path and os.path.normcase(cfg.claude_path) != os.path.normcase(selected):
+            report("warning", f"configured claude_path {cfg.claude_path} is not usable; using {selected}")
+        if cfg.claude_path != selected:
+            cfg.claude_path = selected
+            if cfg.exists:
+                _save(cfg)
+                report("ok", f"recorded claude_path = {selected}")
+        if detect.is_batch_file(selected):
+            report(
+                "warning",
+                f"{selected} is a batch file: cmd.exe may mangle arguments containing & | < > ^ or %; "
+                "the native installer's claude.exe avoids this (https://code.claude.com/docs/en/setup)",
+            )
 
     typer.echo()
     typer.echo("Accounts")
@@ -696,12 +759,11 @@ def _run_doctor(cfg: Config, *, auth: bool) -> int:
         else:
             notes.append("state file: no login recorded")
             level = "warning"
-        service = accounts.keychain_service(account.config_dir)
-        present = accounts.keychain_item_exists(service)
+        present, where = accounts.credentials_status(account.config_dir)
         if present is True:
-            notes.append(f"Keychain item {service!r} present")
+            notes.append(f"credentials in {where}")
         elif present is False:
-            notes.append(f"no Keychain item {service!r}")
+            notes.append(f"no credentials in {where}")
             level = "warning"
         if auth and selected:
             status = accounts.auth_status(selected, cfg, account)
@@ -746,13 +808,17 @@ def _run_doctor(cfg: Config, *, auth: bool) -> int:
             f"{', '.join(exported)} exported: these override the login of every account "
             "(add them to `unset_env` in the config if unintended)",
         )
-    if shutil.which("route-claude"):
-        report("ok", f"route-claude on PATH: {shutil.which('route-claude')}")
+    router = shutil.which("route-claude")
+    if router:
+        report("ok", f"route-claude on PATH: {router}")
     else:
-        report("warning", "route-claude is not on PATH (install with `uv tool install .`; uv puts it in ~/.local/bin)")
+        report(
+            "warning",
+            "route-claude is not on PATH (install with `uv tool install .`, then run `uv tool update-shell` if needed)",
+        )
     for path, number, line in shell_alias_lines():
         if "route-claude" in line:
-            report("ok", f"{display_path(path)}:{number} aliases claude to route-claude")
+            report("ok", f"{display_path(path)}:{number} sends claude through route-claude")
         else:
             report("info", f"{display_path(path)}:{number} has `{line}` (see the alias hint from `configure-route init`)")
 
@@ -768,8 +834,15 @@ def edit() -> None:
     cfg = _load()
     if not cfg.exists:
         _save(cfg)
-    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
-    code = subprocess.call([*shlex.split(editor), str(cfg.path)])
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or ("notepad" if IS_WINDOWS else "vi")
+    command = split_command(editor)
+    if not command:
+        _fail(f"cannot parse the editor command {editor!r}")
+    command[0] = shutil.which(command[0]) or command[0]  # finds code.cmd & co. on Windows
+    try:
+        code = subprocess.call([*command, str(cfg.path)])
+    except OSError as exc:
+        _fail(f"cannot start the editor {editor!r}: {exc}")
     if code != 0:
         _fail(f"editor exited with status {code}", code)
     try:
@@ -778,14 +851,23 @@ def edit() -> None:
         _fail(str(exc), 2)
     problems = validate(cfg)
     for problem in problems:
-        (_warn if problem.level == "warning" else lambda m: typer.secho(f"error: {m}", fg=RED, err=True))(problem.message)
-    if not any(problem.level == "error" for problem in problems):
-        typer.echo(f"{display_path(str(cfg.path))} is valid")
-    else:
+        if problem.level == "warning":
+            _warn(problem.message)
+        else:
+            typer.secho(f"error: {problem.message}", fg=RED, err=True)
+    if any(problem.level == "error" for problem in problems):
         raise typer.Exit(1)
+    typer.echo(f"{display_path(str(cfg.path))} is valid")
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):  # never crash on a name the console code page cannot show
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
     app()
 
 

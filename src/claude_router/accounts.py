@@ -1,4 +1,4 @@
-"""Helpers for individual Claude config directories: identity, Keychain, seeding, discovery."""
+"""Helpers for individual Claude config directories: identity, credentials, seeding, discovery."""
 
 from __future__ import annotations
 
@@ -6,16 +6,18 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Account, Config, home_dir, is_stock_dir, stock_config_dir
+from .config import Account, Config, display_path, home_dir, is_stock_dir, stock_config_dir
 from .resolve import build_env
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+CREDENTIALS_FILE = ".credentials.json"
 STATE_FILE = ".claude.json"
 SEED_FILES = ("settings.json", "keybindings.json", "CLAUDE.md")
 SEED_DIRS = ("skills", "agents", "commands", "output-styles")
@@ -65,37 +67,47 @@ def keychain_service(config_dir: str | None) -> str:
     return f"{KEYCHAIN_SERVICE}-{digest}"
 
 
-def keychain_item_exists(service: str) -> bool | None:
-    """True/False on macOS (metadata lookup only, no secret is read); None elsewhere."""
+def _security(*args: str) -> int | None:
+    """Run macOS ``security`` (metadata only, never ``-w``); None when unavailable."""
     if sys.platform != "darwin" or shutil.which("security") is None:
         return None
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            stdin=subprocess.DEVNULL,
+            ["security", *args], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return result.returncode == 0
+    return result.returncode
+
+
+def keychain_item_exists(service: str) -> bool | None:
+    """True/False on macOS (no secret is read); None elsewhere."""
+    code = _security("find-generic-password", "-s", service)
+    return None if code is None else code == 0
 
 
 def keychain_delete(service: str) -> bool:
-    if sys.platform != "darwin" or shutil.which("security") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["security", "delete-generic-password", "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
+    return _security("delete-generic-password", "-s", service) == 0
+
+
+def credentials_file(config_dir: str) -> str:
+    return os.path.join(config_dir, CREDENTIALS_FILE)
+
+
+def credentials_status(config_dir: str) -> tuple[bool | None, str]:
+    """Whether Claude Code holds credentials for this config dir, and where it keeps them.
+
+    macOS uses the Keychain (with a file fallback); Linux and Windows use
+    ``<config dir>/.credentials.json``.
+    """
+    file_path = credentials_file(config_dir)
+    file_present = os.path.isfile(file_path)
+    if sys.platform == "darwin":
+        service = keychain_service(config_dir)
+        in_keychain = keychain_item_exists(service)
+        if in_keychain is not None and (in_keychain or not file_present):
+            return in_keychain, f"Keychain item {service!r}"
+    return file_present, display_path(file_path)
 
 
 def auth_status(claude_path: str, cfg: Config, account: Account, timeout: float = 30) -> dict | None:
@@ -123,12 +135,25 @@ def auth_status(claude_path: str, cfg: Config, account: Account, timeout: float 
 
 
 def create_config_dir(path: str) -> bool:
-    """Create the directory with mode 0700. Returns True when it was created."""
+    """Create the directory (mode 0700 on POSIX). Returns True when it was created."""
     if os.path.isdir(path):
         return False
     os.makedirs(path, mode=0o700)
     os.chmod(path, 0o700)
     return True
+
+
+def delete_config_dir(path: str) -> None:
+    """``shutil.rmtree`` that also removes read-only files (git objects under plugins/ on Windows)."""
+
+    def make_writable_and_retry(function, target, _error) -> None:
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=make_writable_and_retry)
+    else:  # pragma: no cover - Python 3.11
+        shutil.rmtree(path, onerror=make_writable_and_retry)
 
 
 def seed_dir(src: str, dst: str) -> list[str]:
@@ -162,14 +187,14 @@ def discover_existing_dirs() -> list[str]:
 
 def deletion_refusal(config_dir: str) -> str | None:
     """Why this directory must never be deleted by ``configure-route remove`` (None = allowed)."""
-    real = os.path.realpath(config_dir)
-    home = os.path.realpath(home_dir())
-    if real == os.path.realpath(stock_config_dir()):
+    real = os.path.normcase(os.path.realpath(config_dir))
+    home = os.path.normcase(os.path.realpath(home_dir()))
+    if is_stock_dir(config_dir):
         return "it is the stock ~/.claude directory"
     if real == home:
         return "it is your home directory"
-    if real == os.path.abspath(os.sep):
-        return "it is the filesystem root"
-    if not real.startswith(home + os.sep):
+    if os.path.dirname(real) == real:
+        return "it is a filesystem root"
+    if not real.startswith(home.rstrip(os.sep) + os.sep):
         return "it is outside your home directory"
     return None
